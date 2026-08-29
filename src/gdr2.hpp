@@ -165,7 +165,12 @@ inline std::optional<Replay> parse(const uint8_t* data, size_t size) {
 
     uint64_t total = r.varint();
     uint64_t p1    = r.varint();
-    if (r.bad || total > size * 8) return std::nullopt;
+    // BUGFIX: bound was `total > size * 8`, letting a corrupt/malicious file
+    // claim up to 8x more inputs than it has bytes to actually encode (every
+    // input takes at least 1 byte as a varint, so `total` can never
+    // legitimately exceed `size`). The old bound let rep.inputs.reserve()
+    // over-allocate ~8x the file size before parsing even hit EOF and failed.
+    if (r.bad || total > size) return std::nullopt;
 
     rep.inputs.reserve(size_t(total));
     uint64_t frame = 0;

@@ -21,8 +21,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
-#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -315,12 +315,19 @@ static float snapSpeed(float v) {
 
 // android runs this every frame on a phone cpu, so only actually hit the
 // settings store a few times a second. 0.2s is way below noticing it.
+//
+// BUGFIX: this used std::clock(), which on POSIX measures CPU time consumed
+// by the process, not wall-clock time. It drifts from real time under load
+// and barely advances while the app is backgrounded, so the "refresh every
+// 0.2s" interval was unreliable (and the "t < nextAt - 5.0" branch was a
+// workaround for clock_t wraparound that a steady clock doesn't even need).
+// std::chrono::steady_clock is monotonic wall time and can't wrap here.
 static Look readSettingsCached() {
     static Look cached = readSettings();
-    static double nextAt = 0.0;
-    const double t = double(clock()) / double(CLOCKS_PER_SEC);
-    if (t >= nextAt || t < nextAt - 5.0) {
-        nextAt = t + 0.2;
+    static std::chrono::steady_clock::time_point nextAt{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= nextAt) {
+        nextAt = now + std::chrono::milliseconds(200);
         cached = readSettings();
     }
     return cached;
@@ -330,7 +337,6 @@ static Look readSettingsCached() {
 // mod resources come out as "<modid>/<file>"
 static const char* kDisc   = "bogdoner.click-indicators/taikohitcircle.png";
 static const char* kRing   = "bogdoner.click-indicators/taikohitcircleoverlay.png";
-static const char* kTarget = "bogdoner.click-indicators/sliderfollowcircle.png";
 
 class $modify(IndicatorLayer, PlayLayer) {
     struct Portal { float x; float v; };
@@ -362,9 +368,6 @@ class $modify(IndicatorLayer, PlayLayer) {
         float  lastX = 0.f;
         double lastSpeedTime = 0.0;
 
-        // Position drives the macro clock. No scaling: the walk is already in
-        // macro seconds if the speed profile is right.
-        double scale = 1.0;
         // Position fixes where the attempt begins; elapsed time carries it from
         // there. Model error then applies once instead of compounding.
         double clockBase = 0.0;
@@ -399,7 +402,7 @@ class $modify(IndicatorLayer, PlayLayer) {
         // real sprites for the osu circles. drawDot gives you a blob, these
         // give you an actual circle because they ARE one.
         CCNode* spriteHost = nullptr;
-        std::vector<CCSprite*> discs, rings, targets;
+        std::vector<CCSprite*> discs, rings;
         size_t discUsed = 0, ringUsed = 0;   // bit 0 p1 down, bit 1 p2 down
     };
 
@@ -407,8 +410,14 @@ class $modify(IndicatorLayer, PlayLayer) {
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        if (!Mod::get()->getSettingValue<bool>("enabled")) return true;
 
+        // BUGFIX: this used to bail out here if "enabled" was off, which meant
+        // the draw nodes and macro were never built for this level session.
+        // Flipping "Master enable" back on mid-level then did nothing until
+        // you left and re-entered, contradicting the setting's own description
+        // ("Applies immediately, no level reload."). Node creation and macro
+        // loading now always happen; postUpdate()'s live "enabled" check is
+        // what actually gates drawing/scoring, so toggling works instantly.
         auto f = m_fields.self();
 
         // name for local levels, id for levels on servers, fuck startpos copies they ruin everything angry emoji
@@ -641,10 +650,12 @@ class $modify(IndicatorLayer, PlayLayer) {
     // start once and the real value is observable, then cache it forever.
     float levelStartSpeed() {
         auto f = m_fields.self();
-        for (auto const& p : f->portals) {
-            if (p.x <= 20.f) return p.v;   // an explicit portal still wins
-            break;
-        }
+        // only the very first portal (closest to x=0) can count as "at the
+        // start"; portals are sorted by x, so we only ever need to look at
+        // index 0. (previously a for-loop with an unconditional break after
+        // one iteration -- same result, just confusing to read.)
+        if (!f->portals.empty() && f->portals[0].x <= 20.f)
+            return f->portals[0].v;
         return f->startSpeed;
     }
 
@@ -674,17 +685,20 @@ class $modify(IndicatorLayer, PlayLayer) {
     }
 
     // Position at a macro time, the exact inverse of tAtX.
+    // (previously divided t by a "scale" field that was declared, documented,
+    // and read here -- but never assigned anywhere else, so it was always its
+    // default 1.0. Dead code that did nothing; removed instead of leaving a
+    // trap for the next person who "fixes" it by wiring it up incorrectly.)
     float xAt(double t) {
         auto f = m_fields.self();
         auto const& S = f->segs;
         if (S.empty()) return f->startX + float(t * f->speed);
-        const double raw = t / (f->scale > 0.01 ? f->scale : 1.0);
         size_t lo = 0, hi = S.size() - 1;
         while (lo < hi) {
             const size_t mid = (lo + hi + 1) / 2;
-            if (S[mid].t <= raw) lo = mid; else hi = mid - 1;
+            if (S[mid].t <= t) lo = mid; else hi = mid - 1;
         }
-        return S[lo].x + float((raw - S[lo].t) * S[lo].v);
+        return S[lo].x + float((t - S[lo].t) * S[lo].v);
     }
 
     // FRAMES
@@ -821,9 +835,8 @@ class $modify(IndicatorLayer, PlayLayer) {
 
     void hideSprites() {
         auto f = m_fields.self();
-        for (auto s : f->discs)   s->setVisible(false);
-        for (auto s : f->rings)   s->setVisible(false);
-        for (auto s : f->targets) s->setVisible(false);
+        for (auto s : f->discs) s->setVisible(false);
+        for (auto s : f->rings) s->setVisible(false);
         f->discUsed = f->ringUsed = 0;
     }
 
@@ -1141,7 +1154,14 @@ class $modify(IndicatorLayer, PlayLayer) {
                     if (!tap) continue;
                     if (onTime) f->noteAtLine = true;
                     ccColor4F fill = onTime ? ccColor4F{ 1.f, 1.f, 1.f, 1.f } : body;
-                    placeCircle(take(f->discs, f->discUsed, kDisc), cx, y0, dia, WHITE);
+                    // BUGFIX/POLISH: this drew kDisc (a filled circle) twice,
+                    // once oversized in white as a fake "outline". kRing --
+                    // the actual ring-shaped overlay texture bundled with the
+                    // mod -- was declared but never used anywhere, so its
+                    // sprite pool (f->rings) sat empty the whole time. Using
+                    // the real ring texture gives a proper thin outline
+                    // instead of a solid white disc peeking out from behind.
+                    placeCircle(take(f->rings, f->ringUsed, kRing), cx, y0, dia, WHITE);
                     placeCircle(take(f->discs, f->discUsed, kDisc), cx, y0, inner, fill);
                     ++laneCount;
                 }
@@ -1582,8 +1602,13 @@ class $modify(IndicatorPause, PauseLayer) {
     }
 
     void onGuide(CCObject*) {
+        // BUGFIX: a fast double-tap on the guide button could fire this twice
+        // before the first popup finished showing, stacking two MacroPopups
+        // on top of each other. Bail if one is already open.
+        auto scene = CCDirector::get()->getRunningScene();
+        if (scene && scene->getChildByType<MacroPopup>(0)) return;
         if (auto p = MacroPopup::create())
-            CCDirector::get()->getRunningScene()->addChild(p, 9999);
+            scene->addChild(p, 9999);
     }
 };
 
