@@ -247,10 +247,8 @@
     },
     "resources": {
         "files": [
-            "resources/hitcircle2x.png",
             "resources/taikohitcircle.png",
-            "resources/taikohitcircleoverlay.png",
-            "resources/sliderfollowcircle.png"
+            "resources/taikohitcircleoverlay.png"
         ]
     }
 }
