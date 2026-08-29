@@ -1,0 +1,23 @@
+name: Build Geode Mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          target: Android64
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: click-indicators-android64
+          path: ${{ steps.build.outputs.build-output }}
